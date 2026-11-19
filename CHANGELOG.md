@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-19
+
+### Added
+
+- Automatic XDG configuration lookup at `$XDG_CONFIG_HOME/binger/config.toml` or `~/.config/binger/config.toml`.
+- Explicit `--config PATH` override for selecting a different configuration file.
+
 ## [0.1.0] - 2026-11-19
 
 ### Added

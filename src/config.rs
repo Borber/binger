@@ -1,4 +1,9 @@
-use std::{fs, path::Path};
+use std::{
+    env,
+    ffi::OsStr,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use serde::Deserialize;
 use thiserror::Error;
@@ -47,11 +52,28 @@ impl Default for Config {
 impl Config {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
-        let text = fs::read_to_string(path).map_err(|source| ConfigError::Io {
-            path: path.display().to_string(),
-            source,
-        })?;
-        let config: Self = toml::from_str(&text)?;
+        let text = read_file(path)?;
+        Self::parse(&text)
+    }
+
+    pub fn load_default() -> Result<Self, ConfigError> {
+        let Some(path) = default_path() else {
+            return Ok(Self::default());
+        };
+
+        match Self::load(&path) {
+            Ok(config) => Ok(config),
+            Err(ConfigError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Ok(Self::default())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn parse(text: &str) -> Result<Self, ConfigError> {
+        let config: Self = toml::from_str(text)?;
         config.validate()?;
         Ok(config)
     }
@@ -72,9 +94,33 @@ impl Config {
     }
 }
 
+fn read_file(path: &Path) -> Result<String, ConfigError> {
+    fs::read_to_string(path).map_err(|source| ConfigError::Io {
+        path: path.display().to_string(),
+        source,
+    })
+}
+
+fn default_path() -> Option<PathBuf> {
+    config_base_dir(
+        env::var_os("XDG_CONFIG_HOME").as_deref(),
+        env::var_os("HOME").as_deref(),
+    )
+    .map(|base| base.join("binger/config.toml"))
+}
+
+fn config_base_dir(xdg_config_home: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
+    xdg_config_home
+        .filter(|path| !path.is_empty() && Path::new(path).is_absolute())
+        .map(PathBuf::from)
+        .or_else(|| home.map(|path| PathBuf::from(path).join(".config")))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Config;
+    use std::path::Path;
+
+    use super::{Config, config_base_dir};
 
     #[test]
     fn defaults_match_the_documented_settings() {
@@ -95,5 +141,31 @@ bisect_ratio = 2.0
         .unwrap();
         assert_eq!(config.home_row_keys, "qwertyuiopz");
         assert_eq!(config.bisect_ratio, 2.0);
+    }
+
+    #[test]
+    fn xdg_config_home_takes_precedence_over_home() {
+        let base = config_base_dir(
+            Some(Path::new("/custom/config").as_os_str()),
+            Some(Path::new("/home/test").as_os_str()),
+        )
+        .unwrap();
+        assert_eq!(base, Path::new("/custom/config"));
+    }
+
+    #[test]
+    fn home_falls_back_to_dot_config() {
+        let base = config_base_dir(None, Some(Path::new("/home/test").as_os_str())).unwrap();
+        assert_eq!(base, Path::new("/home/test/.config"));
+    }
+
+    #[test]
+    fn relative_xdg_config_home_is_ignored() {
+        let base = config_base_dir(
+            Some(Path::new("relative/config").as_os_str()),
+            Some(Path::new("/home/test").as_os_str()),
+        )
+        .unwrap();
+        assert_eq!(base, Path::new("/home/test/.config"));
     }
 }

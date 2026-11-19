@@ -40,14 +40,15 @@ fn main() -> ExitCode {
     }
 
     let config = match config_path {
-        Some(path) => match Config::load(path) {
-            Ok(config) => config,
-            Err(error) => {
-                eprintln!("{error}");
-                return ExitCode::from(1);
-            }
-        },
-        None => Config::default(),
+        Some(path) => Config::load(path),
+        None => Config::load_default(),
+    };
+    let config = match config {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::from(1);
+        }
     };
 
     if print_keymap {

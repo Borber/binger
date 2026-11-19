@@ -24,12 +24,18 @@ cargo run
 cargo build --locked --release
 ```
 
-默认构建启用 Wayland 后端。用 `cargo test --no-default-features` 可以只构建和测试核心逻辑。启动时可以指定配置文件。
+默认构建启用 Wayland 后端。用 `cargo test --no-default-features` 可以只构建和测试核心逻辑。启动时会自动读取 `$XDG_CONFIG_HOME/binger/config.toml`，未设置 `XDG_CONFIG_HOME` 时使用 `~/.config/binger/config.toml`。文件不存在时使用内置默认值，`--config PATH` 可以指定其他文件并覆盖自动路径。
 
 release profile 使用三级优化、Thin LTO、单代码生成单元、`panic = "abort"` 和符号剥离。
 
 ```bash
 cargo run -- --config ~/.config/binger/config.toml
+```
+
+Hyprland 启动绑定可以直接使用自动配置路径：
+
+```ini
+bind = SUPER, F, exec, binger
 ```
 
 当 `home_row_keys` 自定义的选区键或点击键与微调键冲突时，配置优先。使用 `--print-keymap` 查看可用的微调键。
