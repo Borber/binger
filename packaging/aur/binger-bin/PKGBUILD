@@ -12,8 +12,7 @@ provides=('binger')
 conflicts=('binger')
 source=("$pkgname-$pkgver.tar.gz::https://github.com/borber/binger/releases/download/v$pkgver/binger-$pkgver-x86_64-unknown-linux-gnu.tar.gz")
 
-# Replace SKIP with the value from the release's SHA256SUMS before submitting.
-sha256sums=('SKIP')
+sha256sums=('6ec0fa6ba5cd919c85c8de7bf21d5107d8e34d3dbeed3c8f8a962e35b4c62275')
 
 package() {
     install -Dm755 binger "$pkgdir/usr/bin/binger"

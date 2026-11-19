@@ -16,7 +16,7 @@ Release 压缩包包含以下文件：
 
 ## AUR
 
-Release 创建后，从对应 Release 的 `SHA256SUMS` 复制压缩包校验和，替换 `packaging/aur/binger-bin/PKGBUILD` 中的 `SKIP`，然后在该目录重新生成 `.SRCINFO`：
+Release 创建后，从对应 Release 的 `SHA256SUMS` 复制压缩包校验和，更新 `packaging/aur/binger-bin/PKGBUILD`，然后在该目录重新生成 `.SRCINFO`：
 
 ```bash
 cd packaging/aur/binger-bin
