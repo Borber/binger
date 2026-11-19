@@ -4,9 +4,23 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.86"
 description = "Keyboard-driven pointer selection for wlroots Wayland compositors"
+authors = ["Borber"]
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/borber/binger"
+keywords = ["wayland", "wlroots", "hyprland", "pointer", "keyboard"]
+categories = ["command-line-utilities"]
+exclude = [".github/", "packaging/"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
 
 [features]
-default = []
+default = ["wayland-backend"]
 wayland-backend = [
     "dep:fontdb",
     "dep:fontdue",
@@ -20,8 +34,7 @@ serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 toml = "1.2"
 
-# The Wayland stack stays optional so the core state machine can be tested
-# independently of a compositor.
+# Disabling default features lets the core build without Wayland dependencies.
 fontdb = { version = "0.24", optional = true }
 fontdue = { version = "0.9", optional = true }
 smithay-client-toolkit = { version = "0.21.1", optional = true }

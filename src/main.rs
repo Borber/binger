@@ -1,10 +1,10 @@
 use std::{env, path::PathBuf, process::ExitCode};
 
-use binger::config::Config;
+use binger::{config::Config, input::AREA_KEY_COUNT};
 
 fn print_help() {
     println!(
-        "binger\n\nUsage\n  binger [--config PATH] [--print-keymap]\n\nOptions\n  --config PATH     load a TOML configuration file\n  --print-keymap    print the configured selection and click keys\n  -h, --help        show this help\n  -V, --version     show the version\n"
+        "binger\n\nUsage\n  binger [--config PATH] [--print-keymap]\n\nOptions\n  --config PATH     load a TOML configuration file\n  --print-keymap    print the selection, click and nudge keys\n  -h, --help        show this help\n  -V, --version     show the version\n"
     );
 }
 
@@ -54,7 +54,7 @@ fn main() -> ExitCode {
         let key_map = config.key_map().expect("the default config is valid");
         println!(
             "area keys: {}",
-            (0..8)
+            (0..AREA_KEY_COUNT)
                 .filter_map(|index| key_map.area_key(index))
                 .collect::<String>()
         );
@@ -69,6 +69,15 @@ fn main() -> ExitCode {
         println!(
             "middle click: {}",
             key_map.click_key(binger::input::MouseButton::Middle)
+        );
+        let nudge_keys: String = key_map.nudge_keys().collect();
+        println!(
+            "nudge keys: {}",
+            if nudge_keys.is_empty() {
+                "(none)"
+            } else {
+                &nudge_keys
+            }
         );
         return ExitCode::SUCCESS;
     }

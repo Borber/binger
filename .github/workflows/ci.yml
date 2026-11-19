@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Check (${{ matrix.toolchain }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: [1.86.0, stable]
+
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@v6
+
+      - name: Install Wayland build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libwayland-dev \
+            libxkbcommon-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          components: rustfmt, clippy
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run default-feature tests
+        run: cargo test --locked
+
+      - name: Run core-only tests
+        run: cargo test --locked --no-default-features
+
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Build release profile
+        run: cargo build --locked --release

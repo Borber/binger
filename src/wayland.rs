@@ -1,14 +1,26 @@
 //! Wayland adapter for the keyboard-driven selection state machine.
 
+use std::{
+    env,
+    io::Read,
+    os::unix::net::UnixStream,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
+
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState, SurfaceData},
     delegate_registry,
     output::{OutputHandler, OutputState},
+    reexports::{
+        calloop::{EventLoop, Interest, Mode, PostAction, generic::Generic},
+        calloop_wayland_source::WaylandSource,
+    },
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
     seat::{
         Capability, SeatHandler, SeatState,
-        keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers},
+        keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers, RepeatInfo},
     },
     shell::{
         WaylandSurface,
@@ -43,6 +55,9 @@ use render::Overlay;
 const BUTTON_LEFT: u32 = 0x110;
 const BUTTON_RIGHT: u32 = 0x111;
 const BUTTON_MIDDLE: u32 = 0x112;
+const NUDGE_INTERVAL: Duration = Duration::from_millis(15);
+const NUDGE_ACCELERATION_INTERVAL: Duration = Duration::from_millis(160);
+const NUDGE_MAX_STEP: u32 = 6;
 
 #[derive(Debug, thiserror::Error)]
 pub enum WaylandError {
@@ -65,9 +80,14 @@ pub enum WaylandError {
 /// Run the interactive overlay until the user clicks, cancels, or the compositor closes it.
 pub fn run(config: Config) -> Result<(), WaylandError> {
     let connection = Connection::connect_to_env().map_err(WaylandError::Connection)?;
-    let (globals, mut event_queue) =
+    let (globals, event_queue) =
         registry_queue_init::<Binger>(&connection).map_err(WaylandError::Registry)?;
     let qh = event_queue.handle();
+    let mut event_loop =
+        EventLoop::try_new().map_err(|error| WaylandError::Dispatch(error.to_string()))?;
+    WaylandSource::new(connection.clone(), event_queue)
+        .insert(event_loop.handle())
+        .map_err(|error| WaylandError::Dispatch(error.to_string()))?;
 
     let compositor = CompositorState::bind(&globals, &qh)
         .map_err(|error| WaylandError::Global(format!("wl_compositor: {error}")))?;
@@ -114,6 +134,8 @@ pub fn run(config: Config) -> Result<(), WaylandError> {
         buffer: None,
         keyboard: None,
         keyboard_focus: false,
+        repeat_info: RepeatInfo::Disable,
+        nudge_repeat: None,
         virtual_pointer_manager,
         virtual_pointer: None,
         selection: None,
@@ -122,12 +144,37 @@ pub fn run(config: Config) -> Result<(), WaylandError> {
         overlay: Overlay::new(&config),
         scale_factor: 1,
         exit: None,
+        hyprland_event_buffer: String::new(),
+        focus_recovery_pending: false,
     };
 
-    let exit = loop {
-        event_queue
-            .blocking_dispatch(&mut state)
+    if let Some(socket) = hyprland_event_socket() {
+        let source = Generic::new(socket, Interest::READ, Mode::Level);
+        event_loop
+            .handle()
+            .insert_source(source, |readiness, socket, state: &mut Binger| {
+                if !readiness.readable {
+                    return Ok(PostAction::Continue);
+                }
+                Ok(state.read_hyprland_events(socket))
+            })
             .map_err(|error| WaylandError::Dispatch(error.to_string()))?;
+    }
+
+    let exit = loop {
+        let timeout = state
+            .nudge_repeat
+            .as_ref()
+            .and_then(|repeat| repeat.next)
+            .map(|next| next.saturating_duration_since(Instant::now()));
+        event_loop
+            .dispatch(timeout, &mut state)
+            .map_err(|error| WaylandError::Dispatch(error.to_string()))?;
+        if state.focus_recovery_pending {
+            state.focus_recovery_pending = false;
+            state.reclaim_keyboard_focus();
+        }
+        state.repeat_nudge(&qh);
         if let Some(exit) = state.exit.take() {
             break exit;
         }
@@ -136,21 +183,22 @@ pub fn run(config: Config) -> Result<(), WaylandError> {
     match exit {
         Exit::Cancel => Ok(()),
         Exit::Error(error) => Err(error),
-        Exit::Click(button, time) => {
-            let (area, bounds) = state
-                .selection
-                .as_ref()
-                .ok_or(WaylandError::PointerUnavailable)?;
+        Exit::Click {
+            button,
+            time,
+            target,
+            bounds,
+        } => {
             let pointer = state
                 .virtual_pointer
-                .as_ref()
+                .take()
                 .ok_or(WaylandError::PointerUnavailable)?;
             // Restore focus before moving to the click target.
-            drop(state.layer);
+            drop(state);
             sync(&connection)?;
-            move_pointer(pointer, area.current(), *bounds, time);
+            move_pointer(&pointer, target, bounds, time);
             sync(&connection)?;
-            click(pointer, button, time);
+            click(&pointer, button, time);
             sync(&connection)
         }
     }
@@ -165,8 +213,25 @@ fn sync(connection: &Connection) -> Result<(), WaylandError> {
 
 enum Exit {
     Cancel,
-    Click(MouseButton, u32),
+    Click {
+        button: MouseButton,
+        time: u32,
+        target: (i32, i32),
+        bounds: Rect,
+    },
     Error(WaylandError),
+}
+
+fn hyprland_event_socket() -> Option<UnixStream> {
+    let runtime_dir = env::var_os("XDG_RUNTIME_DIR")?;
+    let signature = env::var_os("HYPRLAND_INSTANCE_SIGNATURE")?;
+    let path = PathBuf::from(runtime_dir)
+        .join("hypr")
+        .join(signature)
+        .join(".socket2.sock");
+    let socket = UnixStream::connect(path).ok()?;
+    socket.set_nonblocking(true).ok()?;
+    Some(socket)
 }
 
 struct Binger {
@@ -179,14 +244,65 @@ struct Binger {
     buffer: Option<Buffer>,
     keyboard: Option<(wl_seat::WlSeat, wl_keyboard::WlKeyboard)>,
     keyboard_focus: bool,
+    repeat_info: RepeatInfo,
+    nudge_repeat: Option<NudgeRepeat>,
     virtual_pointer_manager: zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1,
     virtual_pointer: Option<zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1>,
-    selection: Option<(BisectState, (u32, u32))>,
+    selection: Option<BisectState>,
     key_map: KeyMap,
     overlay: Overlay,
     scale_factor: u32,
     exit: Option<Exit>,
     ratio: f32,
+    hyprland_event_buffer: String,
+    focus_recovery_pending: bool,
+}
+
+struct NudgeRepeat {
+    raw_code: u32,
+    direction: (i32, i32),
+    press_time: u32,
+    pressed_at: Instant,
+    first_repeat: Option<Instant>,
+    next: Option<Instant>,
+}
+
+impl NudgeRepeat {
+    fn new(event: &KeyEvent, direction: (i32, i32), info: RepeatInfo) -> Self {
+        let pressed_at = Instant::now();
+        let next = match info {
+            RepeatInfo::Repeat { delay, .. } => {
+                Some(pressed_at + Duration::from_millis(delay.into()))
+            }
+            RepeatInfo::Disable => None,
+        };
+        Self {
+            raw_code: event.raw_code,
+            direction,
+            press_time: event.time,
+            pressed_at,
+            first_repeat: None,
+            next,
+        }
+    }
+
+    fn tick(&mut self, now: Instant) -> Option<(i32, u32)> {
+        let due = self.next.filter(|&due| due <= now)?;
+        let next = due + NUDGE_INTERVAL;
+        // Skip missed ticks so a stalled frame cannot cause a sudden jump.
+        self.next = Some(if next <= now {
+            now + NUDGE_INTERVAL
+        } else {
+            next
+        });
+
+        let first_repeat = *self.first_repeat.get_or_insert(now);
+        let held = now.duration_since(first_repeat);
+        let steps = 1 + held.as_millis() / NUDGE_ACCELERATION_INTERVAL.as_millis();
+        let step = steps.min(u128::from(NUDGE_MAX_STEP)) as i32;
+        let elapsed = now.duration_since(self.pressed_at).as_millis() as u32;
+        Some((step, self.press_time.wrapping_add(elapsed)))
+    }
 }
 
 impl CompositorHandler for Binger {
@@ -287,17 +403,14 @@ impl LayerShellHandler for Binger {
         configure: LayerSurfaceConfigure,
         _serial: u32,
     ) {
-        let size = self.configured_size(configure.new_size);
+        let (width, height) = self.configured_size(configure.new_size);
+        let bounds = Rect::new(0, 0, width, height);
         if self
             .selection
             .as_ref()
-            .is_none_or(|(_, bounds)| *bounds != size)
+            .is_none_or(|selection| selection.bounds() != bounds)
         {
-            let (width, height) = size;
-            self.selection = Some((
-                BisectState::new(Rect::new(0, 0, width, height), self.ratio),
-                size,
-            ));
+            self.selection = Some(BisectState::new(bounds, self.ratio));
         }
         self.redraw();
     }
@@ -338,6 +451,8 @@ impl SeatHandler for Binger {
                 .is_some_and(|(bound, _)| *bound == seat)
         {
             self.keyboard_focus = false;
+            self.nudge_repeat = None;
+            self.repeat_info = RepeatInfo::Disable;
             if let Some((_, keyboard)) = self.keyboard.take() {
                 if keyboard.version() >= 3 {
                     keyboard.release();
@@ -365,6 +480,7 @@ impl KeyboardHandler for Binger {
         _keysyms: &[Keysym],
     ) {
         self.keyboard_focus = self.layer.wl_surface() == surface;
+        self.nudge_repeat = None;
     }
 
     fn leave(
@@ -377,6 +493,11 @@ impl KeyboardHandler for Binger {
     ) {
         if self.layer.wl_surface() == surface {
             self.keyboard_focus = false;
+            self.nudge_repeat = None;
+            if self.focus_recovery_pending {
+                self.focus_recovery_pending = false;
+                self.reclaim_keyboard_focus();
+            }
         }
     }
 
@@ -388,7 +509,8 @@ impl KeyboardHandler for Binger {
         _serial: u32,
         event: KeyEvent,
     ) {
-        self.handle_key(qh, event);
+        self.nudge_repeat = None;
+        self.handle_press(qh, &event);
     }
 
     fn repeat_key(
@@ -397,8 +519,19 @@ impl KeyboardHandler for Binger {
         _qh: &QueueHandle<Self>,
         _keyboard: &wl_keyboard::WlKeyboard,
         _serial: u32,
-        _event: KeyEvent,
+        event: KeyEvent,
     ) {
+        if self.exit.is_some() || !self.keyboard_focus {
+            return;
+        }
+        if let Some(repeat) = self
+            .nudge_repeat
+            .as_mut()
+            .filter(|repeat| repeat.raw_code == event.raw_code)
+        {
+            // A compositor-driven repeat starts the same timer used by client-side repeat.
+            repeat.next.get_or_insert_with(Instant::now);
+        }
     }
 
     fn release_key(
@@ -407,8 +540,26 @@ impl KeyboardHandler for Binger {
         _qh: &QueueHandle<Self>,
         _keyboard: &wl_keyboard::WlKeyboard,
         _serial: u32,
-        _event: KeyEvent,
+        event: KeyEvent,
     ) {
+        if self
+            .nudge_repeat
+            .as_ref()
+            .is_some_and(|repeat| repeat.raw_code == event.raw_code)
+        {
+            self.nudge_repeat = None;
+        }
+    }
+
+    fn update_repeat_info(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _keyboard: &wl_keyboard::WlKeyboard,
+        info: RepeatInfo,
+    ) {
+        self.repeat_info = info;
+        self.nudge_repeat = None;
     }
 
     fn update_modifiers(
@@ -431,54 +582,130 @@ impl ShmHandler for Binger {
 }
 
 impl Binger {
-    fn handle_key(&mut self, qh: &QueueHandle<Self>, event: KeyEvent) {
-        if !self.keyboard_focus || self.exit.is_some() {
+    fn read_hyprland_events(&mut self, mut socket: &UnixStream) -> PostAction {
+        let mut buffer = [0_u8; 4096];
+        match socket.read(&mut buffer) {
+            Ok(0) => PostAction::Remove,
+            Ok(size) => {
+                self.hyprland_event_buffer
+                    .push_str(&String::from_utf8_lossy(&buffer[..size]));
+                while let Some(newline) = self.hyprland_event_buffer.find('\n') {
+                    let event = self.hyprland_event_buffer[..newline].trim_end();
+                    if event.starts_with("closelayer>>") {
+                        self.focus_recovery_pending = true;
+                    }
+                    self.hyprland_event_buffer.drain(..=newline);
+                }
+                PostAction::Continue
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                PostAction::Continue
+            }
+            Err(_) => PostAction::Remove,
+        }
+    }
+
+    fn reclaim_keyboard_focus(&mut self) {
+        if self.exit.is_some() || self.keyboard_focus || self.keyboard.is_none() {
+            return;
+        }
+        self.layer
+            .set_keyboard_interactivity(KeyboardInteractivity::None);
+        self.layer.commit();
+        self.layer
+            .set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+        self.layer.commit();
+    }
+
+    fn repeat_nudge(&mut self, qh: &QueueHandle<Self>) {
+        if self.exit.is_some() || !self.keyboard_focus {
+            return;
+        }
+        let Some(repeat) = self.nudge_repeat.as_mut() else {
+            return;
+        };
+        let Some((step, time)) = repeat.tick(Instant::now()) else {
+            return;
+        };
+        let direction = repeat.direction;
+        self.nudge(qh, direction, step, time);
+    }
+
+    fn handle_press(&mut self, qh: &QueueHandle<Self>, event: &KeyEvent) {
+        if self.exit.is_some() {
             return;
         }
         if event.keysym == Keysym::Escape {
             self.exit = Some(Exit::Cancel);
             return;
         }
-        let Some((selection, _)) = self.selection.as_mut() else {
+        if !self.keyboard_focus {
+            return;
+        }
+        let Some(selection) = self.selection.as_mut() else {
             return;
         };
-        if event.keysym == Keysym::BackSpace {
-            if !selection.undo() {
-                return;
-            }
+        let changed = if event.keysym == Keysym::BackSpace {
+            selection.undo()
         } else {
             let Some(character) = event.keysym.key_char() else {
                 return;
             };
-            let action = match self.key_map.action_for(character) {
-                InputAction::Unknown if character.is_ascii_uppercase() => {
-                    self.key_map.action_for(character.to_ascii_lowercase())
+            match self.key_map.action_for(character) {
+                InputAction::Nudge { dx, dy } => {
+                    self.nudge_repeat = Some(NudgeRepeat::new(event, (dx, dy), self.repeat_info));
+                    selection.nudge(dx, dy)
                 }
-                action => action,
-            };
-            match action {
-                InputAction::SelectArea(index) => {
-                    if selection.select(index).is_err() {
-                        return;
-                    }
-                }
+                InputAction::SelectArea(index) => selection.select(index).is_ok(),
                 InputAction::Click(button) => {
+                    let target = selection.target();
+                    let bounds = selection.bounds();
                     self.exit = Some(match self.ensure_pointer(qh) {
-                        Ok(()) => Exit::Click(button, event.time),
+                        Ok(_) => Exit::Click {
+                            button,
+                            time: event.time,
+                            target,
+                            bounds,
+                        },
                         Err(error) => Exit::Error(error),
                     });
                     return;
                 }
                 InputAction::Unknown => return,
             }
+        };
+        if changed {
+            self.update_pointer(qh, event.time);
         }
-        if let Err(error) = self.ensure_pointer(qh) {
-            self.exit = Some(Exit::Error(error));
-            return;
-        }
-        if let (Some(pointer), Some((selection, bounds))) = (&self.virtual_pointer, &self.selection)
+    }
+
+    fn nudge(&mut self, qh: &QueueHandle<Self>, (dx, dy): (i32, i32), step: i32, time: u32) {
+        if self
+            .selection
+            .as_mut()
+            .is_some_and(|selection| selection.nudge(dx * step, dy * step))
         {
-            move_pointer(pointer, selection.current(), *bounds, event.time);
+            self.update_pointer(qh, time);
+        }
+    }
+
+    fn update_pointer(&mut self, qh: &QueueHandle<Self>, time: u32) {
+        let Some(selection) = &self.selection else {
+            return;
+        };
+        let target = selection.target();
+        let bounds = selection.bounds();
+        match self.ensure_pointer(qh) {
+            Ok(pointer) => move_pointer(pointer, target, bounds, time),
+            Err(error) => {
+                self.exit = Some(Exit::Error(error));
+                return;
+            }
         }
         self.redraw();
     }
@@ -490,27 +717,31 @@ impl Binger {
             .and_then(|data| data.outputs().next())
     }
 
-    fn ensure_pointer(&mut self, qh: &QueueHandle<Self>) -> Result<(), WaylandError> {
-        if self.virtual_pointer.is_some() {
-            return Ok(());
+    fn ensure_pointer(
+        &mut self,
+        qh: &QueueHandle<Self>,
+    ) -> Result<&zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1, WaylandError> {
+        if self.virtual_pointer.is_none() {
+            let (seat, _) = self
+                .keyboard
+                .as_ref()
+                .ok_or(WaylandError::PointerUnavailable)?;
+            let manager = &self.virtual_pointer_manager;
+            let output = self.overlay_output();
+            let pointer = match (manager.version(), output.as_ref()) {
+                (2.., Some(output)) => {
+                    manager.create_virtual_pointer_with_output(Some(seat), Some(output), qh, ())
+                }
+                _ if self.output_state.outputs().count() <= 1 => {
+                    manager.create_virtual_pointer(Some(seat), qh, ())
+                }
+                _ => return Err(WaylandError::PointerOutputUnavailable),
+            };
+            self.virtual_pointer = Some(pointer);
         }
-        let (seat, _) = self
-            .keyboard
+        self.virtual_pointer
             .as_ref()
-            .ok_or(WaylandError::PointerUnavailable)?;
-        let manager = &self.virtual_pointer_manager;
-        let output = self.overlay_output();
-        let pointer = match (manager.version(), output.as_ref()) {
-            (2.., Some(output)) => {
-                manager.create_virtual_pointer_with_output(Some(seat), Some(output), qh, ())
-            }
-            _ if self.output_state.outputs().count() <= 1 => {
-                manager.create_virtual_pointer(Some(seat), qh, ())
-            }
-            _ => return Err(WaylandError::PointerOutputUnavailable),
-        };
-        self.virtual_pointer = Some(pointer);
-        Ok(())
+            .ok_or(WaylandError::PointerUnavailable)
     }
 
     fn configured_size(&self, (width, height): (u32, u32)) -> (u32, u32) {
@@ -545,9 +776,10 @@ impl Binger {
     }
 
     fn draw(&mut self) -> Result<(), WaylandError> {
-        let Some((selection, (width, height))) = self.selection.as_ref() else {
+        let Some(selection) = self.selection.as_ref() else {
             return Ok(());
         };
+        let Rect { width, height, .. } = selection.bounds();
         let scale = self.scale_factor;
         let width = width.saturating_mul(scale);
         let height = height.saturating_mul(scale);
@@ -558,7 +790,7 @@ impl Binger {
         }
         let (width_px, height_px) = (width as i32, height as i32);
         let stride = width_px * 4;
-        let (buffer, canvas) = match self.buffer.take() {
+        let (buffer, canvas, reuse_buffer) = match self.buffer.take() {
             Some(buffer)
                 if buffer.stride() == stride
                     && buffer.height() == height_px
@@ -568,22 +800,36 @@ impl Binger {
                     .pool
                     .canvas(&buffer)
                     .expect("buffer belongs to this pool");
-                (buffer, canvas)
+                (buffer, canvas, true)
             }
             _ => self
                 .pool
                 .create_buffer(width_px, height_px, stride, wl_shm::Format::Argb8888)
+                .map(|(buffer, canvas)| (buffer, canvas, false))
                 .map_err(|error| WaylandError::Buffer(error.to_string()))?,
         };
 
-        self.overlay
-            .draw(canvas, width, height, scale, selection, &self.key_map);
+        let damage = self.overlay.draw(
+            canvas,
+            (width, height),
+            scale,
+            selection,
+            &self.key_map,
+            reuse_buffer,
+        );
         let surface = self.layer.wl_surface();
         surface.set_buffer_scale(scale as i32);
         buffer
             .attach_to(surface)
             .map_err(|error| WaylandError::Buffer(error.to_string()))?;
-        surface.damage_buffer(0, 0, width_px, height_px);
+        match damage {
+            Some(areas) => {
+                for area in areas {
+                    surface.damage_buffer(area.x, area.y, area.width as i32, area.height as i32);
+                }
+            }
+            None => surface.damage_buffer(0, 0, width_px, height_px),
+        }
         self.layer.commit();
         self.buffer = Some(buffer);
         Ok(())
@@ -592,12 +838,11 @@ impl Binger {
 
 fn move_pointer(
     pointer: &zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1,
-    area: Rect,
-    (width, height): (u32, u32),
+    (x, y): (i32, i32),
+    bounds: Rect,
     time: u32,
 ) {
-    let (x, y) = area.center();
-    pointer.motion_absolute(time, x as u32, y as u32, width, height);
+    pointer.motion_absolute(time, x as u32, y as u32, bounds.width, bounds.height);
     pointer.frame();
 }
 
@@ -628,3 +873,37 @@ impl ProvidesRegistryState for Binger {
 }
 
 smithay_client_toolkit::delegate_dispatch2!(Binger);
+
+#[cfg(test)]
+mod tests {
+    use super::{Duration, KeyEvent, Keysym, NUDGE_INTERVAL, NudgeRepeat, RepeatInfo};
+
+    #[test]
+    fn nudge_accelerates_at_a_fixed_cadence_and_skips_missed_ticks() {
+        let event = KeyEvent {
+            time: 0,
+            raw_code: 0,
+            keysym: Keysym::h,
+            utf8: None,
+        };
+        let mut repeat = NudgeRepeat::new(&event, (-1, 0), RepeatInfo::Disable);
+        let start = repeat.pressed_at + Duration::from_millis(80);
+        assert_eq!(repeat.tick(start), None);
+        repeat.next = Some(start);
+        assert_eq!(repeat.tick(start), Some((1, 80)));
+        assert_eq!(repeat.tick(start + Duration::from_millis(14)), None);
+
+        for (tick, step) in [(10, 1), (11, 2), (22, 3), (32, 4), (43, 5), (54, 6)] {
+            let elapsed = NUDGE_INTERVAL * tick;
+            assert_eq!(
+                repeat.tick(start + elapsed),
+                Some((step, 80 + elapsed.as_millis() as u32))
+            );
+        }
+
+        let late = start + Duration::from_secs(3);
+        assert_eq!(repeat.tick(late), Some((6, 3080)));
+        assert_eq!(repeat.tick(late), None);
+        assert_eq!(repeat.next, Some(late + NUDGE_INTERVAL));
+    }
+}

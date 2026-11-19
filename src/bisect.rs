@@ -79,7 +79,9 @@ pub enum SelectError {
 
 #[derive(Clone, Debug)]
 pub struct BisectState {
+    bounds: Rect,
     current: Rect,
+    target: (i32, i32),
     history: Vec<Rect>,
     ratio: f32,
 }
@@ -87,14 +89,49 @@ pub struct BisectState {
 impl BisectState {
     pub fn new(initial: Rect, ratio: f32) -> Self {
         Self {
+            bounds: initial,
             current: initial,
+            target: initial.center(),
             history: Vec::new(),
             ratio,
         }
     }
 
+    pub const fn bounds(&self) -> Rect {
+        self.bounds
+    }
+
     pub const fn current(&self) -> Rect {
         self.current
+    }
+
+    pub const fn target(&self) -> (i32, i32) {
+        self.target
+    }
+
+    pub fn nudge(&mut self, dx: i32, dy: i32) -> bool {
+        if self.bounds.is_empty() {
+            return false;
+        }
+        let Rect {
+            x,
+            y,
+            width,
+            height,
+        } = self.bounds;
+        let offset = |position: i32, delta: i32, start: i32, length: u32| {
+            position
+                .saturating_add(delta)
+                .clamp(start, start.saturating_add_unsigned(length - 1))
+        };
+        let (target_x, target_y) = self.target;
+        let target = (
+            offset(target_x, dx, x, width),
+            offset(target_y, dy, y, height),
+        );
+        let moved = target != self.target;
+        self.target = target;
+        moved
     }
 
     pub fn division(&self) -> Division {
@@ -105,8 +142,12 @@ impl BisectState {
     pub fn subareas(&self) -> Vec<Rect> {
         let division = self.division();
         (0..division.slots())
-            .map(|index| sub_rect(self.current, division, index))
+            .map(|index| self.subarea_for(division, index))
             .collect()
+    }
+
+    pub(crate) fn subarea_for(&self, division: Division, index: usize) -> Rect {
+        sub_rect(self.current, division, index)
     }
 
     pub fn depth(&self) -> usize {
@@ -128,6 +169,7 @@ impl BisectState {
         let next = sub_rect(self.current, division, index);
         self.history.push(self.current);
         self.current = next;
+        self.target = next.center();
         Ok(next)
     }
 
@@ -135,6 +177,7 @@ impl BisectState {
         match self.history.pop() {
             Some(previous) => {
                 self.current = previous;
+                self.target = previous.center();
                 true
             }
             None => false,
@@ -220,6 +263,25 @@ mod tests {
         assert_eq!(state.current(), initial);
         assert_ne!(selected, initial);
         assert!(!state.undo());
+    }
+
+    #[test]
+    fn nudges_can_leave_the_selected_area_and_stop_at_the_output_edges() {
+        let mut state = BisectState::new(Rect::new(10, 20, 4, 4), 1.8);
+        let selected = state.select(0).unwrap();
+        assert_eq!(state.target(), (11, 21));
+
+        assert!(state.nudge(1, 0));
+        assert!(state.nudge(1, 0));
+        assert!(!state.nudge(1, 0));
+        assert_eq!(state.target(), (13, 21));
+        assert_eq!(state.current(), selected);
+        assert_eq!(state.depth(), 1);
+
+        assert!(state.nudge(-20, -20));
+        assert_eq!(state.target(), (10, 20));
+        assert!(state.undo());
+        assert_eq!(state.target(), (12, 22));
     }
 
     #[test]

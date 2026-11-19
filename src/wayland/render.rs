@@ -16,6 +16,19 @@ const MAX_CELL_FONT_SIZE: f32 = 512.0;
 const CROSSHAIR: [u8; 3] = [255, 213, 124];
 
 pub(super) struct Overlay {
+    style: GridStyle,
+    background: Vec<u8>,
+    previous_frame: Option<(GridLayout, Rect)>,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct GridLayout {
+    size: (u32, u32),
+    scale: u32,
+    area: Rect,
+}
+
+struct GridStyle {
     font: Option<Font>,
     font_size: u32,
     opacity: u8,
@@ -24,48 +37,96 @@ pub(super) struct Overlay {
 impl Overlay {
     pub(super) fn new(config: &Config) -> Self {
         Self {
-            font: load_font(&config.label_font_family),
-            font_size: config.label_font_size.max(1),
-            opacity: (config.overlay_opacity * 255.0).round() as u8,
+            style: GridStyle {
+                font: load_font(&config.label_font_family),
+                font_size: config.label_font_size.max(1),
+                opacity: (config.overlay_opacity * 255.0).round() as u8,
+            },
+            background: Vec::new(),
+            previous_frame: None,
         }
     }
 
     pub(super) fn draw(
-        &self,
+        &mut self,
         pixels: &mut [u8],
-        width: u32,
-        height: u32,
+        size: (u32, u32),
         scale: u32,
         selection: &BisectState,
         keys: &KeyMap,
-    ) {
-        pixels.fill(0);
+        reuse_buffer: bool,
+    ) -> Option<[Rect; 2]> {
+        let layout = GridLayout {
+            size,
+            scale,
+            area: selection.current(),
+        };
+        let previous_crosshair = self
+            .previous_frame
+            .filter(|&(previous, _)| previous == layout)
+            .map(|(_, crosshair)| crosshair);
+        let (width, height) = size;
+        if previous_crosshair.is_none() {
+            self.background.resize(pixels.len(), 0);
+            self.background.fill(0);
+            let mut background = Canvas {
+                pixels: &mut self.background,
+                width,
+                height,
+            };
+            self.style.draw(&mut background, selection, keys, scale);
+        }
+
         let mut canvas = Canvas {
             pixels,
             width,
             height,
         };
+        if let Some(previous) = previous_crosshair.filter(|_| reuse_buffer) {
+            canvas.restore(previous, &self.background);
+        } else {
+            canvas.pixels.copy_from_slice(&self.background);
+        }
+
+        let (x, y) = selection.target();
+        let arm = 4 * scale;
+        let x = x * scale as i32;
+        let y = y * scale as i32;
+        let length = 2 * arm + scale;
+        let left = x - arm as i32;
+        let top = y - arm as i32;
+        let color = argb(230, CROSSHAIR);
+        canvas.fill(Rect::new(left, y, length, scale), color);
+        canvas.fill(Rect::new(x, top, scale, length), color);
+        let crosshair = Rect::new(left, top, length, length);
+        self.previous_frame = Some((layout, crosshair));
+        previous_crosshair.map(|previous| [previous, crosshair])
+    }
+}
+
+impl GridStyle {
+    fn draw(&self, canvas: &mut Canvas<'_>, selection: &BisectState, keys: &KeyMap, scale: u32) {
         let selected = scaled(selection.current(), scale);
         let division = selection.division();
-        let cells = selection.subareas();
-        let (center_x, center_y) = selection.current().center();
-        let center_x = center_x * scale as i32;
-        let center_y = center_y * scale as i32;
-        let font_size = self.font_size.min(width.min(height) / scale).max(1) as f32 * scale as f32;
+        let slots = division.slots();
+        let size = canvas.width.min(canvas.height) / scale;
+        let font_size = self.font_size.min(size).max(1) as f32 * scale as f32;
 
-        let outside = cells.iter().any(|cell| {
+        let outside = (0..slots).any(|index| {
+            let cell = selection.subarea_for(division, index);
             let height = (cell.height * scale) as f32;
             let width = (cell.width * scale) as f32;
             height <= font_size || width <= font_size
         });
-        for (index, cell) in cells.iter().enumerate() {
+        for index in 0..slots {
+            let cell = selection.subarea_for(division, index);
             let (column, row) = division.cell(index);
             let (fill, edge) = if (column + row) % 2 == 0 {
                 (TEAL, TEAL_EDGE)
             } else {
                 (PLUM, PLUM_EDGE)
             };
-            let area = scaled(*cell, scale);
+            let area = scaled(cell, scale);
             canvas.fill(area, argb(self.opacity, fill));
             canvas.outline(area, scale, argb(200, edge));
             if let (false, Some(font), Some(key)) = (outside, &self.font, keys.area_key(index)) {
@@ -79,17 +140,6 @@ impl Overlay {
         if let (true, Some(font)) = (outside, &self.font) {
             canvas.outside_labels(font, keys, division, selected, font_size, scale);
         }
-
-        let arm = 4 * scale;
-        let color = argb(230, CROSSHAIR);
-        canvas.fill(
-            Rect::new(center_x - arm as i32, center_y, 2 * arm + scale, scale),
-            color,
-        );
-        canvas.fill(
-            Rect::new(center_x, center_y - arm as i32, scale, 2 * arm + scale),
-            color,
-        );
     }
 }
 
@@ -100,6 +150,27 @@ struct Canvas<'a> {
 }
 
 impl Canvas<'_> {
+    fn restore(&mut self, area: Rect, background: &[u8]) {
+        let Some(area) = self.clip(area) else {
+            return;
+        };
+        let stride = self.width as usize * 4;
+        let start = area.y as usize * stride + area.x as usize * 4;
+        for y in 0..area.height as usize {
+            let start = start + y * stride;
+            let row = start..start + area.width as usize * 4;
+            self.pixels[row.clone()].copy_from_slice(&background[row]);
+        }
+    }
+
+    fn clip(&self, area: Rect) -> Option<Rect> {
+        let x = area.x.max(0);
+        let y = area.y.max(0);
+        let right = (area.x + area.width as i32).min(self.width as i32);
+        let bottom = (area.y + area.height as i32).min(self.height as i32);
+        (x < right && y < bottom).then(|| Rect::new(x, y, (right - x) as u32, (bottom - y) as u32))
+    }
+
     fn outside_labels(
         &mut self,
         font: &Font,
@@ -146,21 +217,16 @@ impl Canvas<'_> {
     }
 
     fn fill(&mut self, area: Rect, color: [u8; 4]) {
-        let width = self.width as i32;
-        let x0 = area.x.clamp(0, width) as usize;
-        let x1 = (area.x + area.width as i32).clamp(0, width) as usize;
-        let y0 = area.y.max(0);
-        let y1 = (area.y + area.height as i32).min(self.height as i32);
-        if x0 >= x1 || y0 >= y1 {
+        let Some(area) = self.clip(area) else {
             return;
-        }
+        };
         let stride = self.width as usize * 4;
-        let start = y0 as usize * stride + x0 * 4;
-        let row = start..start + (x1 - x0) * 4;
+        let start = area.y as usize * stride + area.x as usize * 4;
+        let row = start..start + area.width as usize * 4;
         for pixel in self.pixels[row.clone()].chunks_exact_mut(4) {
             pixel.copy_from_slice(&color);
         }
-        for y in 1..(y1 - y0) as usize {
+        for y in 1..area.height as usize {
             self.pixels.copy_within(row.clone(), start + y * stride);
         }
     }
@@ -189,26 +255,35 @@ impl Canvas<'_> {
         let (metrics, bitmap) = font.rasterize(key, size);
         let left = x - metrics.width as i32 / 2;
         let top = y - metrics.height as i32 / 2;
-        for (index, &alpha) in bitmap.iter().enumerate() {
-            if alpha != 0 {
-                let x = left + (index % metrics.width) as i32;
-                let y = top + (index / metrics.width) as i32;
-                self.blend(x, y, LABEL, alpha);
-            }
-        }
-    }
-
-    fn blend(&mut self, x: i32, y: i32, rgb: [u8; 3], alpha: u8) {
-        if x < 0 || x >= self.width as i32 || y < 0 || y >= self.height as i32 {
+        let x0 = left.max(0);
+        let x1 = (left + metrics.width as i32).min(self.width as i32);
+        let y0 = top.max(0);
+        let y1 = (top + metrics.height as i32).min(self.height as i32);
+        if x0 >= x1 || y0 >= y1 {
             return;
         }
-        let index = (y as usize * self.width as usize + x as usize) * 4;
-        let remaining = u16::from(255 - alpha);
-        for (channel, value) in self.pixels[index..index + 4]
-            .iter_mut()
-            .zip(argb(alpha, rgb))
-        {
-            *channel = value + (u16::from(*channel) * remaining / 255) as u8;
+
+        let width = (x1 - x0) as usize;
+        let opaque = argb(255, LABEL);
+        for y in y0..y1 {
+            let source = (y - top) as usize * metrics.width + (x0 - left) as usize;
+            let start = (y as usize * self.width as usize + x0 as usize) * 4;
+            let output = &mut self.pixels[start..start + width * 4];
+            for (&alpha, pixel) in bitmap[source..source + width]
+                .iter()
+                .zip(output.chunks_exact_mut(4))
+            {
+                match alpha {
+                    0 => {}
+                    255 => pixel.copy_from_slice(&opaque),
+                    _ => {
+                        let remaining = u16::from(255 - alpha);
+                        for (channel, value) in pixel.iter_mut().zip(argb(alpha, LABEL)) {
+                            *channel = value + (u16::from(*channel) * remaining / 255) as u8;
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -255,4 +330,50 @@ fn load_font(family: &str) -> Option<Font> {
         )
         .ok()
     })?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BisectState, GridStyle, KeyMap, Overlay, Rect};
+
+    #[test]
+    fn moving_the_crosshair_restores_the_background_and_limits_damage() {
+        let mut overlay = Overlay {
+            style: GridStyle {
+                font: None,
+                font_size: 20,
+                opacity: 102,
+            },
+            background: Vec::new(),
+            previous_frame: None,
+        };
+        let mut selection = BisectState::new(Rect::new(0, 0, 33, 20), 1.8);
+        let keys = KeyMap::default();
+        let size = (66, 40);
+        let mut buffer = vec![0; 66 * 40 * 4];
+        let mut new_buffer = buffer.clone();
+
+        assert_eq!(
+            overlay.draw(&mut buffer, size, 2, &selection, &keys, false),
+            None
+        );
+        selection.nudge(-100, -100);
+        assert_eq!(
+            overlay.draw(&mut buffer, size, 2, &selection, &keys, true),
+            Some([Rect::new(24, 12, 18, 18), Rect::new(-8, -8, 18, 18)])
+        );
+        overlay.draw(&mut new_buffer, size, 2, &selection, &keys, false);
+        assert_eq!(buffer, new_buffer);
+
+        selection.nudge(1, 0);
+        overlay.draw(&mut new_buffer, size, 2, &selection, &keys, true);
+        overlay.draw(&mut buffer, size, 2, &selection, &keys, false);
+        assert_eq!(new_buffer, buffer);
+
+        selection.select(0).unwrap();
+        assert_eq!(
+            overlay.draw(&mut buffer, size, 2, &selection, &keys, true),
+            None
+        );
+    }
 }

@@ -4,6 +4,8 @@ pub const DEFAULT_HOME_ROW_KEYS: &str = "asdfqweruio";
 pub const AREA_KEY_COUNT: usize = 8;
 pub const CLICK_KEY_COUNT: usize = 3;
 pub const REQUIRED_KEY_COUNT: usize = AREA_KEY_COUNT + CLICK_KEY_COUNT;
+const NUDGE_KEYS: [(char, (i32, i32)); 4] =
+    [('h', (-1, 0)), ('j', (0, 1)), ('k', (0, -1)), ('l', (1, 0))];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MouseButton {
@@ -12,10 +14,15 @@ pub enum MouseButton {
     Middle,
 }
 
+impl MouseButton {
+    const ALL: [Self; CLICK_KEY_COUNT] = [Self::Left, Self::Right, Self::Middle];
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InputAction {
     SelectArea(usize),
     Click(MouseButton),
+    Nudge { dx: i32, dy: i32 },
     Unknown,
 }
 
@@ -68,22 +75,27 @@ impl KeyMap {
     }
 
     pub fn action_for(&self, key: char) -> InputAction {
-        if let Some(index) = self.keys[..AREA_KEY_COUNT]
-            .iter()
-            .position(|candidate| *candidate == key)
-        {
-            return InputAction::SelectArea(index);
+        let lower = key.to_ascii_lowercase();
+        let position = |key| self.keys.iter().position(|&candidate| candidate == key);
+        let index = position(key).or_else(|| if key == lower { None } else { position(lower) });
+        match index {
+            Some(index) if index < AREA_KEY_COUNT => InputAction::SelectArea(index),
+            Some(index) => InputAction::Click(MouseButton::ALL[index - AREA_KEY_COUNT]),
+            None => {
+                if let Some(&(_, (dx, dy))) = NUDGE_KEYS.iter().find(|&&(key, _)| key == lower) {
+                    InputAction::Nudge { dx, dy }
+                } else {
+                    InputAction::Unknown
+                }
+            }
         }
+    }
 
-        let click_index = self.keys[AREA_KEY_COUNT..]
-            .iter()
-            .position(|candidate| *candidate == key);
-        match click_index {
-            Some(0) => InputAction::Click(MouseButton::Left),
-            Some(1) => InputAction::Click(MouseButton::Right),
-            Some(2) => InputAction::Click(MouseButton::Middle),
-            _ => InputAction::Unknown,
-        }
+    pub fn nudge_keys(&self) -> impl Iterator<Item = char> + '_ {
+        NUDGE_KEYS
+            .into_iter()
+            .map(|(key, _)| key)
+            .filter(|&key| matches!(self.action_for(key), InputAction::Nudge { .. }))
     }
 
     pub fn as_str(&self) -> String {
@@ -117,6 +129,31 @@ mod tests {
         assert_eq!(map.action_for('a'), InputAction::SelectArea(0));
         assert_eq!(map.action_for('r'), InputAction::SelectArea(7));
         assert_eq!(map.action_for('x'), InputAction::Unknown);
+    }
+
+    #[test]
+    fn nudge_keys_respect_explicit_mappings() {
+        let map = KeyMap::default();
+        assert_eq!(map.nudge_keys().collect::<String>(), "hjkl");
+        assert_eq!(map.action_for('h'), InputAction::Nudge { dx: -1, dy: 0 });
+        assert_eq!(map.action_for('j'), InputAction::Nudge { dx: 0, dy: 1 });
+        assert_eq!(map.action_for('k'), InputAction::Nudge { dx: 0, dy: -1 });
+        assert_eq!(map.action_for('L'), InputAction::Nudge { dx: 1, dy: 0 });
+
+        let legacy = KeyMap::parse("asdfqwerjkl").unwrap();
+        assert_eq!(legacy.nudge_keys().collect::<String>(), "h");
+        assert_eq!(
+            legacy.action_for('J'),
+            InputAction::Click(MouseButton::Left)
+        );
+
+        let custom = KeyMap::parse("hsdfqwerHio").unwrap();
+        assert_eq!(custom.nudge_keys().collect::<String>(), "jkl");
+        assert_eq!(custom.action_for('h'), InputAction::SelectArea(0));
+        assert_eq!(
+            custom.action_for('H'),
+            InputAction::Click(MouseButton::Left)
+        );
     }
 
     #[test]

@@ -20,6 +20,13 @@
 
 1. 在 Hyprland 多屏会话中验证覆盖层和点击是否落在同一块显示器，包括 HiDPI 和混合缩放。
 
+## Release preparation
+
+- 添加 MIT 许可证、Cargo 发布元数据和 `CHANGELOG.md`
+- 添加 GitHub Actions 检查工作流和 `v*.*.*` Release 工作流
+- 添加基于 GitHub Release 二进制资产的 `binger-bin` AUR 模板
+- 待公开仓库和 `v0.1.0` Release 建立后，将 Release 资产的 SHA256 写入 AUR `PKGBUILD` 和 `.SRCINFO`，再提交 AUR
+
 ## Deliberate exclusions
 
 - OpenCV 和屏幕截图

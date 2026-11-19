@@ -1,0 +1,68 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Linux x86_64 release
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@v6
+
+      - name: Install Wayland build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libwayland-dev \
+            libxkbcommon-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run release tests
+        run: cargo test --locked --all-features
+
+      - name: Build release binary
+        run: cargo build --locked --release
+
+      - name: Assemble release archive
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          archive="binger-${version}-x86_64-unknown-linux-gnu.tar.gz"
+          staging="$(mktemp -d)"
+          source_date_epoch="$(git log -1 --format=%ct)"
+          mkdir -p dist
+
+          install -Dm755 target/release/binger "$staging/binger"
+          install -Dm644 README.md "$staging/README.md"
+          install -Dm644 CHANGELOG.md "$staging/CHANGELOG.md"
+          install -Dm644 LICENSE "$staging/LICENSE"
+          install -Dm644 config.example.toml "$staging/config.example.toml"
+
+          tar \
+            --sort=name \
+            --owner=0 \
+            --group=0 \
+            --numeric-owner \
+            --mtime="@$source_date_epoch" \
+            -C "$staging" \
+            -cf - . | gzip -n > "dist/$archive"
+          sha256sum "dist/$archive" > dist/SHA256SUMS
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --verify-tag \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            dist/*
