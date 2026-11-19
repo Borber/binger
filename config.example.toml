@@ -1,0 +1,13 @@
+# Fixed keyboard pointer selection configuration.
+# In an eight-cell grid, keys 5–8 are on top and keys 1–4 are on the bottom.
+# The final three characters trigger left, right and middle click.
+home_row_keys = "asdfqweruio"
+
+# Wide areas use a 4x2 split. Other areas use a 2x2 split.
+bisect_ratio = 1.8
+
+label_font_family = "Maple Mono NF"
+# Minimum label size in logical pixels. Smaller cells use labels outside the grid.
+label_font_size = 20
+overlay_opacity = 0.4
+

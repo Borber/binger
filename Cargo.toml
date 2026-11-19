@@ -1,0 +1,30 @@
+[package]
+name = "binger"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.86"
+description = "Keyboard-driven pointer selection for wlroots Wayland compositors"
+
+[features]
+default = []
+wayland-backend = [
+    "dep:fontdb",
+    "dep:fontdue",
+    "dep:smithay-client-toolkit",
+    "dep:wayland-client",
+    "dep:wayland-protocols-wlr",
+]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+toml = "1.2"
+
+# The Wayland stack stays optional so the core state machine can be tested
+# independently of a compositor.
+fontdb = { version = "0.24", optional = true }
+fontdue = { version = "0.9", optional = true }
+smithay-client-toolkit = { version = "0.21.1", optional = true }
+wayland-client = { version = "0.31.15", optional = true }
+wayland-protocols-wlr = { version = "0.3.12", features = ["client"], optional = true }
+
