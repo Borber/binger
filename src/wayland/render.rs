@@ -1,5 +1,5 @@
 use fontdb::{Database, Family, Query};
-use fontdue::{Font, FontSettings};
+use fontdue::{Font, FontSettings, Metrics};
 
 use crate::{
     bisect::{BisectState, Division, Rect},
@@ -253,6 +253,10 @@ impl Canvas<'_> {
 
     fn label(&mut self, font: &Font, key: char, (x, y): (i32, i32), size: f32) {
         let (metrics, bitmap) = font.rasterize(key, size);
+        self.draw_glyph(&metrics, &bitmap, (x, y));
+    }
+
+    fn draw_glyph(&mut self, metrics: &Metrics, bitmap: &[u8], (x, y): (i32, i32)) {
         let left = x - metrics.width as i32 / 2;
         let top = y - metrics.height as i32 / 2;
         let x0 = left.max(0);

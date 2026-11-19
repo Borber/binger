@@ -39,11 +39,7 @@ fn main() -> ExitCode {
         }
     }
 
-    let config = match config_path {
-        Some(path) => Config::load(path),
-        None => Config::load_default(),
-    };
-    let config = match config {
+    let config = match config_path.map_or_else(Config::load_default, Config::load) {
         Ok(config) => config,
         Err(error) => {
             eprintln!("{error}");
@@ -60,7 +56,7 @@ fn main() -> ExitCode {
                 .collect::<String>()
         );
         println!(
-            "left click: {}",
+            "left click: {} (Enter/Space)",
             key_map.click_key(binger::input::MouseButton::Left)
         );
         println!(

@@ -8,16 +8,21 @@ use std::{
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::input::{DEFAULT_HOME_ROW_KEYS, KeyMap, KeyMapError};
+use crate::input::{DEFAULT_HOME_ROW_KEYS, DEFAULT_NUDGE_KEYS, KeyMap, KeyMapError};
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub home_row_keys: String,
+    pub nudge_keys: String,
     pub bisect_ratio: f32,
     pub label_font_family: String,
     pub label_font_size: u32,
     pub overlay_opacity: f32,
+    pub nudge_step: i32,
+    pub nudge_interval_ms: u64,
+    pub nudge_acceleration_interval_ms: u64,
+    pub nudge_max_step: i32,
 }
 
 #[derive(Debug, Error)]
@@ -35,16 +40,29 @@ pub enum ConfigError {
     InvalidRatio,
     #[error("overlay_opacity must be between 0 and 1")]
     InvalidOpacity,
+    #[error("nudge_step must be greater than zero")]
+    InvalidNudgeStep,
+    #[error("nudge_interval_ms must be greater than zero")]
+    InvalidNudgeInterval,
+    #[error("nudge_acceleration_interval_ms must be greater than zero")]
+    InvalidNudgeAccelerationInterval,
+    #[error("nudge_max_step must be greater than zero")]
+    InvalidNudgeMaxStep,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             home_row_keys: DEFAULT_HOME_ROW_KEYS.to_owned(),
+            nudge_keys: DEFAULT_NUDGE_KEYS.to_owned(),
             bisect_ratio: 1.8,
             label_font_family: "Maple Mono NF".to_owned(),
             label_font_size: 20,
             overlay_opacity: 0.4,
+            nudge_step: 1,
+            nudge_interval_ms: 15,
+            nudge_acceleration_interval_ms: 160,
+            nudge_max_step: 6,
         }
     }
 }
@@ -52,7 +70,10 @@ impl Default for Config {
 impl Config {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
-        let text = read_file(path)?;
+        let text = fs::read_to_string(path).map_err(|source| ConfigError::Io {
+            path: path.display().to_string(),
+            source,
+        })?;
         Self::parse(&text)
     }
 
@@ -79,26 +100,34 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
-        KeyMap::parse(&self.home_row_keys)?;
+        KeyMap::parse_with_nudge_keys(&self.home_row_keys, &self.nudge_keys)?;
         if self.bisect_ratio <= 0.0 {
             return Err(ConfigError::InvalidRatio);
         }
         if !(0.0..=1.0).contains(&self.overlay_opacity) {
             return Err(ConfigError::InvalidOpacity);
         }
+        if self.nudge_step <= 0 {
+            return Err(ConfigError::InvalidNudgeStep);
+        }
+        if self.nudge_interval_ms == 0 {
+            return Err(ConfigError::InvalidNudgeInterval);
+        }
+        if self.nudge_acceleration_interval_ms == 0 {
+            return Err(ConfigError::InvalidNudgeAccelerationInterval);
+        }
+        if self.nudge_max_step <= 0 {
+            return Err(ConfigError::InvalidNudgeMaxStep);
+        }
         Ok(())
     }
 
     pub fn key_map(&self) -> Result<KeyMap, ConfigError> {
-        Ok(KeyMap::parse(&self.home_row_keys)?)
+        Ok(KeyMap::parse_with_nudge_keys(
+            &self.home_row_keys,
+            &self.nudge_keys,
+        )?)
     }
-}
-
-fn read_file(path: &Path) -> Result<String, ConfigError> {
-    fs::read_to_string(path).map_err(|source| ConfigError::Io {
-        path: path.display().to_string(),
-        source,
-    })
 }
 
 fn default_path() -> Option<PathBuf> {
@@ -126,7 +155,12 @@ mod tests {
     fn defaults_match_the_documented_settings() {
         let config = Config::default();
         assert_eq!(config.home_row_keys, "asdfqweruio");
+        assert_eq!(config.nudge_keys, "hjkl");
         assert_eq!(config.bisect_ratio, 1.8);
+        assert_eq!(config.nudge_step, 1);
+        assert_eq!(config.nudge_interval_ms, 15);
+        assert_eq!(config.nudge_acceleration_interval_ms, 160);
+        assert_eq!(config.nudge_max_step, 6);
         assert!(config.validate().is_ok());
     }
 
@@ -135,12 +169,16 @@ mod tests {
         let config: Config = toml::from_str(
             r#"
 home_row_keys = "qwertyuiopz"
+nudge_keys = "hjkl"
 bisect_ratio = 2.0
+nudge_step = 2
 "#,
         )
         .unwrap();
         assert_eq!(config.home_row_keys, "qwertyuiopz");
+        assert_eq!(config.nudge_keys, "hjkl");
         assert_eq!(config.bisect_ratio, 2.0);
+        assert_eq!(config.nudge_step, 2);
     }
 
     #[test]

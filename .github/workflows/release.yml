@@ -7,6 +7,11 @@ on:
 
 permissions:
   contents: write
+  actions: write
+
+env:
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: sccache
 
 jobs:
   release:
@@ -19,20 +24,16 @@ jobs:
 
       - name: Install Wayland build dependencies
         run: |
-          for attempt in 1 2 3; do
-            if sudo apt-get -o Acquire::Retries=3 update && \
-              sudo apt-get -o Acquire::Retries=3 install --no-install-recommends -y \
-                libwayland-dev \
-                libxkbcommon-dev; then
-              exit 0
-            fi
-            echo "apt attempt $attempt failed, retrying"
-            sleep "$((attempt * 10))"
-          done
-          exit 1
+          sudo apt-get -o Acquire::Retries=3 update
+          sudo apt-get -o Acquire::Retries=3 install --no-install-recommends -y \
+            libwayland-dev \
+            libxkbcommon-dev
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Enable sccache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
       - name: Run release tests
         run: cargo test --locked --all-features

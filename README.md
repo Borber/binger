@@ -4,8 +4,10 @@
 
 - 在全屏透明覆盖层上进行二分选择
 - `asdfqwer` 选择区域。八格布局上排为 `qwer`、下排为 `asdf`，四格布局使用 `asdf`
-- `h`、`j`、`k`、`l` 以准星为起点向左、下、上、右移动。点按移动 1 个逻辑像素。长按连发后每 15 毫秒移动一次，步长逐渐增至 6 个逻辑像素
+- `h`、`j`、`k`、`l` 以准星为起点向左、下、上、右移动。点按移动 1 个逻辑像素。长按连发后按配置的间隔移动，步长逐渐增加
+- 可以同时按住两个微调键进行斜向移动，例如 `h+j` 向左下移动
 - `u`、`i`、`o` 分别触发左键、右键和中键
+- `Enter`、`Space` 和数字键盘回车也触发左键
 - `Backspace` 回到上一级选区并将准星移到该选区中心
 - `Escape` 取消
 - 不截图、不做 OCR、不做 OpenCV 区域检测
@@ -38,7 +40,11 @@ Hyprland 启动绑定可以直接使用自动配置路径：
 bind = SUPER, F, exec, binger
 ```
 
-当 `home_row_keys` 自定义的选区键或点击键与微调键冲突时，配置优先。使用 `--print-keymap` 查看可用的微调键。
+`nudge_keys` 按左、下、上、右的顺序配置微调键。使用 `--print-keymap` 查看可用的微调键。
+
+如果 `nudge_keys` 与 `home_row_keys` 重复，选区或点击键优先使用，重复的微调键不会生效。
+
+`nudge_step` 控制单次微调的逻辑像素数，`nudge_interval_ms` 控制长按移动间隔，`nudge_acceleration_interval_ms` 控制加速周期，`nudge_max_step` 控制最大加速步长。
 
 ## Hyprland 启动绑定
 

@@ -55,9 +55,6 @@ use render::Overlay;
 const BUTTON_LEFT: u32 = 0x110;
 const BUTTON_RIGHT: u32 = 0x111;
 const BUTTON_MIDDLE: u32 = 0x112;
-const NUDGE_INTERVAL: Duration = Duration::from_millis(15);
-const NUDGE_ACCELERATION_INTERVAL: Duration = Duration::from_millis(160);
-const NUDGE_MAX_STEP: u32 = 6;
 
 #[derive(Debug, thiserror::Error)]
 pub enum WaylandError {
@@ -135,12 +132,16 @@ pub fn run(config: Config) -> Result<(), WaylandError> {
         keyboard: None,
         keyboard_focus: false,
         repeat_info: RepeatInfo::Disable,
-        nudge_repeat: None,
+        nudge_repeats: Vec::new(),
         virtual_pointer_manager,
         virtual_pointer: None,
         selection: None,
         ratio: config.bisect_ratio,
         key_map,
+        nudge_step: config.nudge_step,
+        nudge_interval: Duration::from_millis(config.nudge_interval_ms),
+        nudge_acceleration_interval: Duration::from_millis(config.nudge_acceleration_interval_ms),
+        nudge_max_step: config.nudge_max_step,
         overlay: Overlay::new(&config),
         scale_factor: 1,
         exit: None,
@@ -162,11 +163,7 @@ pub fn run(config: Config) -> Result<(), WaylandError> {
     }
 
     let exit = loop {
-        let timeout = state
-            .nudge_repeat
-            .as_ref()
-            .and_then(|repeat| repeat.next)
-            .map(|next| next.saturating_duration_since(Instant::now()));
+        let timeout = state.next_nudge_timeout();
         event_loop
             .dispatch(timeout, &mut state)
             .map_err(|error| WaylandError::Dispatch(error.to_string()))?;
@@ -245,7 +242,7 @@ struct Binger {
     keyboard: Option<(wl_seat::WlSeat, wl_keyboard::WlKeyboard)>,
     keyboard_focus: bool,
     repeat_info: RepeatInfo,
-    nudge_repeat: Option<NudgeRepeat>,
+    nudge_repeats: Vec<NudgeRepeat>,
     virtual_pointer_manager: zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1,
     virtual_pointer: Option<zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1>,
     selection: Option<BisectState>,
@@ -256,6 +253,10 @@ struct Binger {
     ratio: f32,
     hyprland_event_buffer: String,
     focus_recovery_pending: bool,
+    nudge_step: i32,
+    nudge_interval: Duration,
+    nudge_acceleration_interval: Duration,
+    nudge_max_step: i32,
 }
 
 struct NudgeRepeat {
@@ -265,10 +266,20 @@ struct NudgeRepeat {
     pressed_at: Instant,
     first_repeat: Option<Instant>,
     next: Option<Instant>,
+    interval: Duration,
+    acceleration_interval: Duration,
+    max_step: i32,
 }
 
 impl NudgeRepeat {
-    fn new(event: &KeyEvent, direction: (i32, i32), info: RepeatInfo) -> Self {
+    fn new(
+        event: &KeyEvent,
+        direction: (i32, i32),
+        info: RepeatInfo,
+        interval: Duration,
+        acceleration_interval: Duration,
+        max_step: i32,
+    ) -> Self {
         let pressed_at = Instant::now();
         let next = match info {
             RepeatInfo::Repeat { delay, .. } => {
@@ -283,23 +294,26 @@ impl NudgeRepeat {
             pressed_at,
             first_repeat: None,
             next,
+            interval,
+            acceleration_interval,
+            max_step,
         }
     }
 
     fn tick(&mut self, now: Instant) -> Option<(i32, u32)> {
         let due = self.next.filter(|&due| due <= now)?;
-        let next = due + NUDGE_INTERVAL;
+        let next = due + self.interval;
         // Skip missed ticks so a stalled frame cannot cause a sudden jump.
         self.next = Some(if next <= now {
-            now + NUDGE_INTERVAL
+            now + self.interval
         } else {
             next
         });
 
         let first_repeat = *self.first_repeat.get_or_insert(now);
         let held = now.duration_since(first_repeat);
-        let steps = 1 + held.as_millis() / NUDGE_ACCELERATION_INTERVAL.as_millis();
-        let step = steps.min(u128::from(NUDGE_MAX_STEP)) as i32;
+        let steps = 1 + held.as_millis() / self.acceleration_interval.as_millis();
+        let step = steps.min(self.max_step as u128) as i32;
         let elapsed = now.duration_since(self.pressed_at).as_millis() as u32;
         Some((step, self.press_time.wrapping_add(elapsed)))
     }
@@ -338,10 +352,11 @@ impl CompositorHandler for Binger {
     fn surface_enter(
         &mut self,
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
         _surface: &wl_surface::WlSurface,
         _output: &wl_output::WlOutput,
     ) {
+        self.move_pointer_if_ready(qh, 0);
     }
 
     fn surface_leave(
@@ -398,7 +413,7 @@ impl LayerShellHandler for Binger {
     fn configure(
         &mut self,
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
         _layer: &LayerSurface,
         configure: LayerSurfaceConfigure,
         _serial: u32,
@@ -412,6 +427,7 @@ impl LayerShellHandler for Binger {
         {
             self.selection = Some(BisectState::new(bounds, self.ratio));
         }
+        self.move_pointer_if_ready(qh, 0);
         self.redraw();
     }
 }
@@ -433,6 +449,7 @@ impl SeatHandler for Binger {
         if capability == Capability::Keyboard && self.keyboard.is_none() {
             if let Ok(keyboard) = self.seat_state.get_keyboard(qh, &seat, None) {
                 self.keyboard = Some((seat, keyboard));
+                self.move_pointer_if_ready(qh, 0);
             }
         }
     }
@@ -451,7 +468,7 @@ impl SeatHandler for Binger {
                 .is_some_and(|(bound, _)| *bound == seat)
         {
             self.keyboard_focus = false;
-            self.nudge_repeat = None;
+            self.nudge_repeats.clear();
             self.repeat_info = RepeatInfo::Disable;
             if let Some((_, keyboard)) = self.keyboard.take() {
                 if keyboard.version() >= 3 {
@@ -480,7 +497,7 @@ impl KeyboardHandler for Binger {
         _keysyms: &[Keysym],
     ) {
         self.keyboard_focus = self.layer.wl_surface() == surface;
-        self.nudge_repeat = None;
+        self.nudge_repeats.clear();
     }
 
     fn leave(
@@ -493,7 +510,7 @@ impl KeyboardHandler for Binger {
     ) {
         if self.layer.wl_surface() == surface {
             self.keyboard_focus = false;
-            self.nudge_repeat = None;
+            self.nudge_repeats.clear();
             if self.focus_recovery_pending {
                 self.focus_recovery_pending = false;
                 self.reclaim_keyboard_focus();
@@ -509,7 +526,6 @@ impl KeyboardHandler for Binger {
         _serial: u32,
         event: KeyEvent,
     ) {
-        self.nudge_repeat = None;
         self.handle_press(qh, &event);
     }
 
@@ -525,9 +541,9 @@ impl KeyboardHandler for Binger {
             return;
         }
         if let Some(repeat) = self
-            .nudge_repeat
-            .as_mut()
-            .filter(|repeat| repeat.raw_code == event.raw_code)
+            .nudge_repeats
+            .iter_mut()
+            .find(|repeat| repeat.raw_code == event.raw_code)
         {
             // A compositor-driven repeat starts the same timer used by client-side repeat.
             repeat.next.get_or_insert_with(Instant::now);
@@ -542,13 +558,8 @@ impl KeyboardHandler for Binger {
         _serial: u32,
         event: KeyEvent,
     ) {
-        if self
-            .nudge_repeat
-            .as_ref()
-            .is_some_and(|repeat| repeat.raw_code == event.raw_code)
-        {
-            self.nudge_repeat = None;
-        }
+        self.nudge_repeats
+            .retain(|repeat| repeat.raw_code != event.raw_code);
     }
 
     fn update_repeat_info(
@@ -559,7 +570,7 @@ impl KeyboardHandler for Binger {
         info: RepeatInfo,
     ) {
         self.repeat_info = info;
-        self.nudge_repeat = None;
+        self.nudge_repeats.clear();
     }
 
     fn update_modifiers(
@@ -622,18 +633,40 @@ impl Binger {
         self.layer.commit();
     }
 
+    fn next_nudge_timeout(&self) -> Option<Duration> {
+        self.nudge_repeats
+            .iter()
+            .filter_map(|repeat| repeat.next)
+            .min()
+            .map(|next| next.saturating_duration_since(Instant::now()))
+    }
+
     fn repeat_nudge(&mut self, qh: &QueueHandle<Self>) {
         if self.exit.is_some() || !self.keyboard_focus {
             return;
         }
-        let Some(repeat) = self.nudge_repeat.as_mut() else {
+        if self.nudge_repeats.is_empty() {
             return;
-        };
-        let Some((step, time)) = repeat.tick(Instant::now()) else {
-            return;
-        };
-        let direction = repeat.direction;
-        self.nudge(qh, direction, step, time);
+        }
+        let now = Instant::now();
+        let mut delta = (0_i32, 0_i32);
+        let mut time = None;
+        for repeat in &mut self.nudge_repeats {
+            let Some((step, event_time)) = repeat.tick(now) else {
+                continue;
+            };
+            let step = step.saturating_mul(self.nudge_step);
+            delta.0 = delta
+                .0
+                .saturating_add(repeat.direction.0.saturating_mul(step));
+            delta.1 = delta
+                .1
+                .saturating_add(repeat.direction.1.saturating_mul(step));
+            time = Some(event_time);
+        }
+        if let Some(time) = time {
+            self.nudge(qh, delta, 1, time);
+        }
     }
 
     fn handle_press(&mut self, qh: &QueueHandle<Self>, event: &KeyEvent) {
@@ -651,18 +684,40 @@ impl Binger {
             return;
         };
         let changed = if event.keysym == Keysym::BackSpace {
+            self.nudge_repeats.clear();
             selection.undo()
         } else {
-            let Some(character) = event.keysym.key_char() else {
-                return;
-            };
-            match self.key_map.action_for(character) {
-                InputAction::Nudge { dx, dy } => {
-                    self.nudge_repeat = Some(NudgeRepeat::new(event, (dx, dy), self.repeat_info));
-                    selection.nudge(dx, dy)
+            let action = match event.keysym {
+                Keysym::Return | Keysym::KP_Enter | Keysym::space | Keysym::KP_Space => {
+                    InputAction::Click(MouseButton::Left)
                 }
-                InputAction::SelectArea(index) => selection.select(index).is_ok(),
+                _ => {
+                    let Some(character) = event.keysym.key_char() else {
+                        return;
+                    };
+                    self.key_map.action_for(character)
+                }
+            };
+            match action {
+                InputAction::Nudge { dx, dy } => {
+                    self.nudge_repeats
+                        .retain(|repeat| repeat.raw_code != event.raw_code);
+                    self.nudge_repeats.push(NudgeRepeat::new(
+                        event,
+                        (dx, dy),
+                        self.repeat_info,
+                        self.nudge_interval,
+                        self.nudge_acceleration_interval,
+                        self.nudge_max_step,
+                    ));
+                    selection.nudge(dx * self.nudge_step, dy * self.nudge_step)
+                }
+                InputAction::SelectArea(index) => {
+                    self.nudge_repeats.clear();
+                    selection.select(index).is_ok()
+                }
                 InputAction::Click(button) => {
+                    self.nudge_repeats.clear();
                     let target = selection.target();
                     let bounds = selection.bounds();
                     self.exit = Some(match self.ensure_pointer(qh) {
@@ -676,7 +731,10 @@ impl Binger {
                     });
                     return;
                 }
-                InputAction::Unknown => return,
+                InputAction::Unknown => {
+                    self.nudge_repeats.clear();
+                    return;
+                }
             }
         };
         if changed {
@@ -695,8 +753,20 @@ impl Binger {
     }
 
     fn update_pointer(&mut self, qh: &QueueHandle<Self>, time: u32) {
+        if self.move_pointer_if_ready(qh, time) {
+            self.redraw();
+        }
+    }
+
+    fn move_pointer_if_ready(&mut self, qh: &QueueHandle<Self>, time: u32) -> bool {
+        if self.keyboard.is_none() || self.selection.is_none() {
+            return false;
+        }
+        if self.overlay_output().is_none() && self.output_state.outputs().count() != 1 {
+            return false;
+        }
         let Some(selection) = &self.selection else {
-            return;
+            return false;
         };
         let target = selection.target();
         let bounds = selection.bounds();
@@ -704,10 +774,9 @@ impl Binger {
             Ok(pointer) => move_pointer(pointer, target, bounds, time),
             Err(error) => {
                 self.exit = Some(Exit::Error(error));
-                return;
             }
         }
-        self.redraw();
+        true
     }
 
     fn overlay_output(&self) -> Option<wl_output::WlOutput> {
@@ -876,7 +945,7 @@ smithay_client_toolkit::delegate_dispatch2!(Binger);
 
 #[cfg(test)]
 mod tests {
-    use super::{Duration, KeyEvent, Keysym, NUDGE_INTERVAL, NudgeRepeat, RepeatInfo};
+    use super::{Duration, KeyEvent, Keysym, NudgeRepeat, RepeatInfo};
 
     #[test]
     fn nudge_accelerates_at_a_fixed_cadence_and_skips_missed_ticks() {
@@ -886,7 +955,14 @@ mod tests {
             keysym: Keysym::h,
             utf8: None,
         };
-        let mut repeat = NudgeRepeat::new(&event, (-1, 0), RepeatInfo::Disable);
+        let mut repeat = NudgeRepeat::new(
+            &event,
+            (-1, 0),
+            RepeatInfo::Disable,
+            Duration::from_millis(15),
+            Duration::from_millis(160),
+            6,
+        );
         let start = repeat.pressed_at + Duration::from_millis(80);
         assert_eq!(repeat.tick(start), None);
         repeat.next = Some(start);
@@ -894,7 +970,7 @@ mod tests {
         assert_eq!(repeat.tick(start + Duration::from_millis(14)), None);
 
         for (tick, step) in [(10, 1), (11, 2), (22, 3), (32, 4), (43, 5), (54, 6)] {
-            let elapsed = NUDGE_INTERVAL * tick;
+            let elapsed = Duration::from_millis(15 * tick);
             assert_eq!(
                 repeat.tick(start + elapsed),
                 Some((step, 80 + elapsed.as_millis() as u32))
@@ -904,6 +980,6 @@ mod tests {
         let late = start + Duration::from_secs(3);
         assert_eq!(repeat.tick(late), Some((6, 3080)));
         assert_eq!(repeat.tick(late), None);
-        assert_eq!(repeat.next, Some(late + NUDGE_INTERVAL));
+        assert_eq!(repeat.next, Some(late + Duration::from_millis(15)));
     }
 }

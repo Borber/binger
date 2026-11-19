@@ -3,6 +3,9 @@
 # The final three characters trigger left, right and middle click.
 home_row_keys = "asdfqweruio"
 
+# Four keys map to left, down, up and right micro-movements.
+nudge_keys = "hjkl"
+
 # Wide areas use a 4x2 split. Other areas use a 2x2 split.
 bisect_ratio = 1.8
 
@@ -10,4 +13,10 @@ label_font_family = "Maple Mono NF"
 # Minimum label size in logical pixels. Smaller cells use labels outside the grid.
 label_font_size = 20
 overlay_opacity = 0.4
+
+# Micro-movement tuning.
+nudge_step = 1
+nudge_interval_ms = 15
+nudge_acceleration_interval_ms = 160
+nudge_max_step = 6
 
