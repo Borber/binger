@@ -19,6 +19,8 @@
 - 支持同时按住两个微调键进行斜向移动
 - 支持 Enter、Space 及数字键盘对应按键触发左键
 - 在启动阶段同步初始指针位置
+- 直接运行 `binger` 切换当前 Wayland 会话的覆盖层
+- 并行查找字体和初始化 Wayland，直接在共享缓冲区绘制首帧
 
 ## Next
 
@@ -28,8 +30,7 @@
 
 - 添加 MIT 许可证、Cargo 发布元数据和 `CHANGELOG.md`
 - 添加 GitHub Actions 检查工作流和 `v*.*.*` Release 工作流
-- 添加基于 GitHub Release 二进制资产的 `binger-bin` AUR 模板
-- 待公开仓库和 `v0.1.0` Release 建立后，将 Release 资产的 SHA256 写入 AUR `PKGBUILD` 和 `.SRCINFO`，再提交 AUR
+- 发布基于 GitHub Release 二进制资产的 `binger-bin` AUR 包，更新步骤见 [发布流程](releasing.md)
 
 ## Deliberate exclusions
 

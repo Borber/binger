@@ -34,12 +34,6 @@ release profile 使用三级优化、Thin LTO、单代码生成单元、`panic =
 cargo run -- --config ~/.config/binger/config.toml
 ```
 
-Hyprland 启动绑定可以直接使用自动配置路径：
-
-```ini
-bind = SUPER, F, exec, binger
-```
-
 `nudge_keys` 按左、下、上、右的顺序配置微调键。使用 `--print-keymap` 查看可用的微调键。
 
 如果 `nudge_keys` 与 `home_row_keys` 重复，选区或点击键优先使用，重复的微调键不会生效。
@@ -48,10 +42,17 @@ bind = SUPER, F, exec, binger
 
 ## Hyprland 启动绑定
 
-后端完成后可以使用下面的绑定保留现有的启动和关闭行为：
+在 Linux 上运行 `binger` 打开覆盖层，再运行一次关闭当前 Wayland 显示会话中的覆盖层。也可以用 `Escape` 关闭。
 
 ```ini
-bind = SUPER, F, exec, pgrep -x binger >/dev/null && pkill -x binger || binger
+bind = SUPER, F, exec, binger
+```
+
+使用 Lua 配置的 Hyprland 可以为 `binger` 单独关闭覆盖层动画，让首帧直接显示。[Hyprland Layer Rules](https://wiki.hypr.land/Configuring/Core/Rules/Layer-Rules/)
+
+```lua
+hl.bind("SUPER + F", hl.dsp.exec_cmd("binger"))
+hl.layer_rule({ match = { namespace = "binger" }, no_anim = true })
 ```
 
 ## 设计边界

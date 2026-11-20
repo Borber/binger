@@ -2,12 +2,12 @@
 
 ## Runtime flow
 
-1. 连接 Wayland display 并枚举 compositor、shm、seat、output、layer shell 和 virtual pointer globals。
+1. 在 Linux 上按当前 Wayland 显示会话查找已有实例。有实例时通知它关闭并退出，否则连接 Wayland 并与系统字体查找并行初始化。
 2. 创建覆盖整个目标 output 的 overlay layer surface。
 3. 请求键盘焦点，并把 surface 的 input region 设为空，让鼠标事件继续传递给下面的应用。
 4. 在设置了 `HYPRLAND_INSTANCE_SIGNATURE` 的 Hyprland 会话中订阅 compositor 事件。其他 layer surface 关闭后，重新提交一次键盘交互状态，以恢复截图选择器退出时可能丢失的键盘焦点。
 5. 将当前区域初始化为 output 的逻辑矩形。
-6. 为当前选区绘制双色格子和子区域标签。八格布局上排显示 `qwer`，下排显示 `asdf`。
+6. 在共享缓冲区绘制双色格子和子区域标签。八格布局上排显示 `qwer`，下排显示 `asdf`。
 7. 区域选择和回退会将点击目标置于选区中心。微调键按配置顺序映射到左、下、上、右方向，在显示器逻辑坐标内移动点击目标。多个微调键同时按下时合并各方向位移，从而支持斜向移动。长按沿用 Wayland 的键盘重复启动时机，间隔和加速参数由配置控制。指针和准星使用同一个目标坐标。
 8. 收到点击键（默认为 `u`、`i`、`o`）后，先销毁覆盖层并同步 Wayland 连接，再移动指针到记录的目标位置并分别发送鼠标按下和释放帧。
 9. 收到 `Escape` 后销毁 surface 并退出，不发送指针事件。

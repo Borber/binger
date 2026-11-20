@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.3] - 2026-11-21
+
+### Changed
+
+- 在 Linux 上直接运行 `binger` 即可打开或关闭当前 Wayland 会话的覆盖层。Hyprland 快捷键可以直接绑定 `binger`。
+- 启动时并行查找字体和初始化 Wayland，按需栅格化标签，并直接在共享缓冲区绘制首帧。
+- README 增加 Hyprland Lua 绑定和覆盖层动画设置。
+
 ## [0.1.2] - 2026-11-19
 
 ### Added

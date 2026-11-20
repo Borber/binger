@@ -63,7 +63,7 @@ jobs:
             --mtime="@$source_date_epoch" \
             -C "$staging" \
             -cf - . | gzip -n > "dist/$archive"
-          sha256sum "dist/$archive" > dist/SHA256SUMS
+          (cd dist && sha256sum "$archive" > SHA256SUMS)
 
       - name: Publish GitHub release
         env:

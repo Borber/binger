@@ -3,8 +3,9 @@
 use std::{
     env,
     io::Read,
-    os::unix::net::UnixStream,
+    os::unix::net::{UnixListener, UnixStream},
     path::PathBuf,
+    thread,
     time::{Duration, Instant},
 };
 
@@ -52,12 +53,23 @@ use crate::{
 mod render;
 use render::Overlay;
 
+#[cfg(target_os = "linux")]
+mod toggle;
+#[cfg(target_os = "linux")]
+pub use toggle::toggle;
+
 const BUTTON_LEFT: u32 = 0x110;
 const BUTTON_RIGHT: u32 = 0x111;
 const BUTTON_MIDDLE: u32 = 0x112;
 
 #[derive(Debug, thiserror::Error)]
 pub enum WaylandError {
+    #[cfg(target_os = "linux")]
+    #[error("could not toggle the overlay: {0}")]
+    Toggle(#[source] std::io::Error),
+    #[cfg(target_os = "linux")]
+    #[error(transparent)]
+    Config(#[from] crate::config::ConfigError),
     #[error("could not connect to the Wayland compositor: {0}")]
     Connection(#[source] wayland_client::ConnectError),
     #[error("Wayland registry initialization failed: {0}")]
@@ -76,7 +88,13 @@ pub enum WaylandError {
 
 /// Run the interactive overlay until the user clicks, cancels, or the compositor closes it.
 pub fn run(config: Config) -> Result<(), WaylandError> {
+    run_overlay(config, None)
+}
+
+fn run_overlay(config: Config, toggle_listener: Option<UnixListener>) -> Result<(), WaylandError> {
     let connection = Connection::connect_to_env().map_err(WaylandError::Connection)?;
+    let font_family = config.label_font_family.clone();
+    let font = thread::Builder::new().spawn(move || render::load_font(&font_family));
     let (globals, event_queue) =
         registry_queue_init::<Binger>(&connection).map_err(WaylandError::Registry)?;
     let qh = event_queue.handle();
@@ -114,12 +132,19 @@ pub fn run(config: Config) -> Result<(), WaylandError> {
     layer.wl_surface().set_input_region(Some(&input_region));
     input_region.destroy();
     layer.commit();
+    connection
+        .flush()
+        .map_err(|error| WaylandError::Dispatch(error.to_string()))?;
 
     let pool = SlotPool::new(4 * 1024 * 1024, &shm)
         .map_err(|error| WaylandError::Buffer(error.to_string()))?;
     let key_map = config
         .key_map()
         .map_err(|error| WaylandError::Global(format!("invalid key map: {error}")))?;
+    let font = match font {
+        Ok(worker) => worker.join().expect("font lookup panicked"),
+        Err(_) => render::load_font(&config.label_font_family),
+    };
 
     let mut state = Binger {
         registry_state,
@@ -142,7 +167,7 @@ pub fn run(config: Config) -> Result<(), WaylandError> {
         nudge_interval: Duration::from_millis(config.nudge_interval_ms),
         nudge_acceleration_interval: Duration::from_millis(config.nudge_acceleration_interval_ms),
         nudge_max_step: config.nudge_max_step,
-        overlay: Overlay::new(&config),
+        overlay: Overlay::new(&config, font),
         scale_factor: 1,
         exit: None,
         hyprland_event_buffer: String::new(),
@@ -161,6 +186,13 @@ pub fn run(config: Config) -> Result<(), WaylandError> {
             })
             .map_err(|error| WaylandError::Dispatch(error.to_string()))?;
     }
+
+    #[cfg(target_os = "linux")]
+    if let Some(listener) = toggle_listener {
+        toggle::register(event_loop.handle(), listener)?;
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = toggle_listener;
 
     let exit = loop {
         let timeout = state.next_nudge_timeout();

@@ -4,7 +4,7 @@ use binger::{config::Config, input::AREA_KEY_COUNT};
 
 fn print_help() {
     println!(
-        "binger\n\nUsage\n  binger [--config PATH] [--print-keymap]\n\nOptions\n  --config PATH     load a TOML configuration file\n  --print-keymap    print the selection, click and nudge keys\n  -h, --help        show this help\n  -V, --version     show the version\n"
+        "binger\n\nUsage\n  binger [--config PATH] [--print-keymap]\n\nOn Linux, run binger again to close the overlay in the current Wayland session.\n\nOptions\n  --config PATH     load a TOML configuration file\n  --print-keymap    print the selection, click and nudge keys\n  -h, --help        show this help\n  -V, --version     show the version\n"
     );
 }
 
@@ -24,6 +24,7 @@ fn main() -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             "--print-keymap" => print_keymap = true,
+            "--toggle" => {} // Accepted by existing Hyprland bindings.
             "--config" => {
                 let Some(path) = args.next() else {
                     eprintln!("--config requires a path");
@@ -39,7 +40,13 @@ fn main() -> ExitCode {
         }
     }
 
-    let config = match config_path.map_or_else(Config::load_default, Config::load) {
+    let load_config = || config_path.map_or_else(Config::load_default, Config::load);
+    #[cfg(all(feature = "wayland-backend", target_os = "linux"))]
+    if !print_keymap {
+        return report_wayland_result(binger::wayland::toggle(load_config));
+    }
+
+    let config = match load_config() {
         Ok(config) => config,
         Err(error) => {
             eprintln!("{error}");
@@ -80,13 +87,7 @@ fn main() -> ExitCode {
     }
 
     #[cfg(feature = "wayland-backend")]
-    return match binger::wayland::run(config) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("{error}");
-            ExitCode::from(1)
-        }
-    };
+    return report_wayland_result(binger::wayland::run(config));
 
     #[cfg(not(feature = "wayland-backend"))]
     {
@@ -94,5 +95,16 @@ fn main() -> ExitCode {
         println!("configured keys: {}", config.home_row_keys);
         println!("Wayland backend is disabled in this build; use --features wayland-backend");
         ExitCode::SUCCESS
+    }
+}
+
+#[cfg(feature = "wayland-backend")]
+fn report_wayland_result(result: Result<(), binger::wayland::WaylandError>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::from(1)
+        }
     }
 }

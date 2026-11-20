@@ -1,5 +1,7 @@
+use std::{ffi::OsStr, fs, ops::Range, os::unix::ffi::OsStrExt, process::Command};
+
+use ab_glyph::{Font, FontVec};
 use fontdb::{Database, Family, Query};
-use fontdue::{Font, FontSettings, Metrics};
 
 use crate::{
     bisect::{BisectState, Division, Rect},
@@ -18,6 +20,7 @@ const CROSSHAIR: [u8; 3] = [255, 213, 124];
 pub(super) struct Overlay {
     style: GridStyle,
     background: Vec<u8>,
+    crosshair_background: Vec<u8>,
     previous_frame: Option<(GridLayout, Rect)>,
 }
 
@@ -29,20 +32,21 @@ struct GridLayout {
 }
 
 struct GridStyle {
-    font: Option<Font>,
+    font: Option<FontVec>,
     font_size: u32,
     opacity: u8,
 }
 
 impl Overlay {
-    pub(super) fn new(config: &Config) -> Self {
+    pub(super) fn new(config: &Config, font: Option<FontVec>) -> Self {
         Self {
             style: GridStyle {
-                font: load_font(&config.label_font_family),
+                font,
                 font_size: config.label_font_size.max(1),
                 opacity: (config.overlay_opacity * 255.0).round() as u8,
             },
             background: Vec::new(),
+            crosshair_background: Vec::new(),
             previous_frame: None,
         }
     }
@@ -66,26 +70,42 @@ impl Overlay {
             .filter(|&(previous, _)| previous == layout)
             .map(|(_, crosshair)| crosshair);
         let (width, height) = size;
-        if previous_crosshair.is_none() {
-            self.background.resize(pixels.len(), 0);
-            self.background.fill(0);
-            let mut background = Canvas {
-                pixels: &mut self.background,
-                width,
-                height,
-            };
-            self.style.draw(&mut background, selection, keys, scale);
-        }
-
         let mut canvas = Canvas {
             pixels,
             width,
             height,
         };
-        if let Some(previous) = previous_crosshair.filter(|_| reuse_buffer) {
-            canvas.restore(previous, &self.background);
-        } else {
-            canvas.pixels.copy_from_slice(&self.background);
+        match previous_crosshair {
+            Some(previous) if reuse_buffer => {
+                let mut saved = self.crosshair_background.as_slice();
+                for row in canvas.rows(previous) {
+                    let (pixels, rest) = saved.split_at(row.len());
+                    canvas.pixels[row].copy_from_slice(pixels);
+                    saved = rest;
+                }
+            }
+            Some(_) => {
+                // A second buffer may be needed while the compositor holds the previous one.
+                if self.background.is_empty() {
+                    self.background.resize(canvas.pixels.len(), 0);
+                    let mut background = Canvas {
+                        pixels: &mut self.background,
+                        width,
+                        height,
+                    };
+                    self.style.draw(&mut background, selection, keys, scale);
+                }
+                canvas.pixels.copy_from_slice(&self.background);
+            }
+            None => {
+                self.background.clear();
+                if scaled(layout.area, scale) != Rect::new(0, 0, width, height)
+                    || selection.division() == Division::Undividable
+                {
+                    canvas.pixels.fill(0);
+                }
+                self.style.draw(&mut canvas, selection, keys, scale);
+            }
         }
 
         let (x, y) = selection.target();
@@ -95,10 +115,15 @@ impl Overlay {
         let length = 2 * arm + scale;
         let left = x - arm as i32;
         let top = y - arm as i32;
+        let crosshair = Rect::new(left, top, length, length);
+        self.crosshair_background.clear();
+        for row in canvas.rows(crosshair) {
+            self.crosshair_background
+                .extend_from_slice(&canvas.pixels[row]);
+        }
         let color = argb(230, CROSSHAIR);
         canvas.fill(Rect::new(left, y, length, scale), color);
         canvas.fill(Rect::new(x, top, scale, length), color);
-        let crosshair = Rect::new(left, top, length, length);
         self.previous_frame = Some((layout, crosshair));
         previous_crosshair.map(|previous| [previous, crosshair])
     }
@@ -150,17 +175,14 @@ struct Canvas<'a> {
 }
 
 impl Canvas<'_> {
-    fn restore(&mut self, area: Rect, background: &[u8]) {
-        let Some(area) = self.clip(area) else {
-            return;
-        };
+    fn rows(&self, area: Rect) -> impl Iterator<Item = Range<usize>> + use<> {
+        let area = self.clip(area).unwrap_or(Rect::new(0, 0, 0, 0));
         let stride = self.width as usize * 4;
         let start = area.y as usize * stride + area.x as usize * 4;
-        for y in 0..area.height as usize {
+        (0..area.height as usize).map(move |y| {
             let start = start + y * stride;
-            let row = start..start + area.width as usize * 4;
-            self.pixels[row.clone()].copy_from_slice(&background[row]);
-        }
+            start..start + area.width as usize * 4
+        })
     }
 
     fn clip(&self, area: Rect) -> Option<Rect> {
@@ -173,7 +195,7 @@ impl Canvas<'_> {
 
     fn outside_labels(
         &mut self,
-        font: &Font,
+        font: &FontVec,
         keys: &KeyMap,
         division: Division,
         area: Rect,
@@ -251,44 +273,40 @@ impl Canvas<'_> {
         }
     }
 
-    fn label(&mut self, font: &Font, key: char, (x, y): (i32, i32), size: f32) {
-        let (metrics, bitmap) = font.rasterize(key, size);
-        self.draw_glyph(&metrics, &bitmap, (x, y));
-    }
-
-    fn draw_glyph(&mut self, metrics: &Metrics, bitmap: &[u8], (x, y): (i32, i32)) {
-        let left = x - metrics.width as i32 / 2;
-        let top = y - metrics.height as i32 / 2;
-        let x0 = left.max(0);
-        let x1 = (left + metrics.width as i32).min(self.width as i32);
-        let y0 = top.max(0);
-        let y1 = (top + metrics.height as i32).min(self.height as i32);
-        if x0 >= x1 || y0 >= y1 {
+    fn label(&mut self, font: &FontVec, key: char, (x, y): (i32, i32), size: f32) {
+        let Some(units_per_em) = font.units_per_em() else {
             return;
-        }
+        };
+        // Label sizes use pixels per em. ab_glyph scales by line height.
+        let glyph = font
+            .glyph_id(key)
+            .with_scale(size * font.height_unscaled() / units_per_em);
+        let Some(outline) = font.outline_glyph(glyph) else {
+            return;
+        };
+        let bounds = outline.px_bounds();
+        let left = x - bounds.width() as i32 / 2;
+        let top = y - bounds.height() as i32 / 2;
 
-        let width = (x1 - x0) as usize;
         let opaque = argb(255, LABEL);
-        for y in y0..y1 {
-            let source = (y - top) as usize * metrics.width + (x0 - left) as usize;
-            let start = (y as usize * self.width as usize + x0 as usize) * 4;
-            let output = &mut self.pixels[start..start + width * 4];
-            for (&alpha, pixel) in bitmap[source..source + width]
-                .iter()
-                .zip(output.chunks_exact_mut(4))
-            {
-                match alpha {
-                    0 => {}
-                    255 => pixel.copy_from_slice(&opaque),
-                    _ => {
-                        let remaining = u16::from(255 - alpha);
-                        for (channel, value) in pixel.iter_mut().zip(argb(alpha, LABEL)) {
-                            *channel = value + (u16::from(*channel) * remaining / 255) as u8;
-                        }
-                    }
+        outline.draw(|x, y, coverage| {
+            let alpha = (coverage * 255.0 + 0.5) as u8;
+            let x = (left + x as i32) as u32;
+            let y = (top + y as i32) as u32;
+            if alpha == 0 || x >= self.width || y >= self.height {
+                return;
+            }
+            let start = (y as usize * self.width as usize + x as usize) * 4;
+            let pixel = &mut self.pixels[start..start + 4];
+            if alpha == 255 {
+                pixel.copy_from_slice(&opaque);
+            } else {
+                let remaining = u16::from(255 - alpha);
+                for (channel, value) in pixel.iter_mut().zip(argb(alpha, LABEL)) {
+                    *channel = value + (u16::from(*channel) * remaining / 255) as u8;
                 }
             }
-        }
+        });
     }
 }
 
@@ -312,7 +330,11 @@ fn argb(alpha: u8, [red, green, blue]: [u8; 3]) -> [u8; 4] {
     .to_ne_bytes()
 }
 
-fn load_font(family: &str) -> Option<Font> {
+pub(super) fn load_font(family: &str) -> Option<FontVec> {
+    if let Some(font) = load_fontconfig_match(family) {
+        return Some(font);
+    }
+
     let mut database = Database::new();
     database.load_system_fonts();
     let id = database
@@ -323,17 +345,33 @@ fn load_font(family: &str) -> Option<Font> {
         .or_else(|| database.faces().next().map(|face| face.id))?;
 
     database.with_face_data(id, |data, collection_index| {
-        Font::from_bytes(
-            data,
-            FontSettings {
-                collection_index,
-                // Fontdue flattens curves when loading the face. Keep enough detail for 4× buffers.
-                scale: MAX_CELL_FONT_SIZE * 4.0,
-                load_substitutions: false,
-            },
-        )
-        .ok()
+        FontVec::try_from_vec_and_index(data.to_vec(), collection_index).ok()
     })?
+}
+
+fn load_fontconfig_match(family: &str) -> Option<FontVec> {
+    let mut pattern = String::from(":family=");
+    for character in family.chars() {
+        if matches!(character, '\\' | ',' | ':' | '=') {
+            pattern.push('\\');
+        }
+        pattern.push(character);
+    }
+    let output = Command::new("fc-match")
+        .args(["--format", "%{index}\\n%{file}"])
+        .arg(pattern)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let mut fields = output.stdout.splitn(2, |&byte| byte == b'\n');
+    let index = std::str::from_utf8(fields.next()?).ok()?;
+    let path = OsStr::from_bytes(fields.next()?);
+    // Fontconfig stores a variable font's named instance in the high 16 bits.
+    let face_index = index.parse::<u32>().ok()? & 0xffff;
+    FontVec::try_from_vec_and_index(fs::read(path).ok()?, face_index).ok()
 }
 
 #[cfg(test)]
@@ -349,13 +387,14 @@ mod tests {
                 opacity: 102,
             },
             background: Vec::new(),
+            crosshair_background: Vec::new(),
             previous_frame: None,
         };
         let mut selection = BisectState::new(Rect::new(0, 0, 33, 20), 1.8);
         let keys = KeyMap::default();
         let size = (66, 40);
-        let mut buffer = vec![0; 66 * 40 * 4];
-        let mut new_buffer = buffer.clone();
+        let mut buffer = vec![255; 66 * 40 * 4];
+        let mut new_buffer = vec![0; buffer.len()];
 
         assert_eq!(
             overlay.draw(&mut buffer, size, 2, &selection, &keys, false),
@@ -379,5 +418,6 @@ mod tests {
             overlay.draw(&mut buffer, size, 2, &selection, &keys, true),
             None
         );
+        assert_eq!(&buffer[buffer.len() - 4..], &[0; 4]);
     }
 }
